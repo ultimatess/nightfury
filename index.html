@@ -1249,21 +1249,61 @@
 
       try {
         document.getElementById("bleBtnText").textContent = "Searching...";
+        
+        const candidateServices = [
+          "0000fa02-0000-1000-8000-00805f9b34fb",
+          "0000fa00-0000-1000-8000-00805f9b34fb",
+          "0000ffe0-0000-1000-8000-00805f9b34fb",
+          "0000fff0-0000-1000-8000-00805f9b34fb",
+          0xfa02, 0xfa00, 0xffe0, 0xfff0
+        ];
+
         bleDevice = await navigator.bluetooth.requestDevice({
           filters: [
             { namePrefix: "LED_BLE" },
             { namePrefix: "LED" },
             { namePrefix: "iPixel" }
           ],
-          optionalServices: [IPIXEL_SERVICE_UUID, 0xfa02]
+          optionalServices: candidateServices
         });
 
         bleDevice.addEventListener('gattserverdisconnected', onBleDisconnected);
         showIosToast(`Connecting to ${bleDevice.name || 'Matrix'}...`, "📡");
 
         const server = await bleDevice.gatt.connect();
-        const service = await server.getPrimaryService(IPIXEL_SERVICE_UUID).catch(() => server.getPrimaryService(0xfa02));
-        bleCharacteristic = await service.getCharacteristic(IPIXEL_WRITE_UUID);
+        
+        // Dynamic Resolution: Discover all available services instead of querying a single fixed UUID directly
+        let services = [];
+        try {
+          services = await server.getPrimaryServices();
+        } catch (e) {
+          console.warn("getPrimaryServices error, falling back to direct lookup:", e);
+          const targetSvc = await server.getPrimaryService(IPIXEL_SERVICE_UUID).catch(() => server.getPrimaryService(0xfa02));
+          services = [targetSvc];
+        }
+
+        bleCharacteristic = null;
+
+        // Inspect discovered services and latch onto the first writable characteristic
+        for (const service of services) {
+          try {
+            const characteristics = await service.getCharacteristics();
+            for (const char of characteristics) {
+              if (char.properties.write || char.properties.writeWithoutResponse) {
+                bleCharacteristic = char;
+                console.log(`Latched onto writable characteristic: ${char.uuid} in service: ${service.uuid}`);
+                break;
+              }
+            }
+          } catch (e) {
+            console.warn(`Could not fetch characteristics for service ${service.uuid}:`, e);
+          }
+          if (bleCharacteristic) break;
+        }
+
+        if (!bleCharacteristic) {
+          throw new Error("No writable GATT characteristic found on device.");
+        }
 
         isBleConnected = true;
         document.getElementById("bleStatusDot").className = "w-2 h-2 rounded-full bg-emerald-500";
@@ -1274,18 +1314,27 @@
         document.getElementById("islandBleIcon").classList.add("text-emerald-400");
         showIosToast("Connected to Windshield Display!", "✅");
 
-        // Send handshake packet
+        // Engage background keep-alive audio, screen wake-lock & heartbeat
+        requestWakeLock();
+        enableBackgroundKeepAliveAudio();
+        startBleHeartbeat();
+
+        // Send initial handshake packet
         await sendBleCommand([0x05, 0x00, 0x07, 0x01, 0x01]);
 
       } catch (err) {
-        console.warn("BLE Pairing Note:", err);
+        console.warn("BLE Pairing Note / Error:", err);
         document.getElementById("bleBtnText").textContent = "Pair Matrix";
-        showIosToast("Pairing cancelled / Virtual Mode active", "ℹ️");
+        showIosToast(`BLE Error: ${err.message || 'Virtual Mode active'}`, "⚠️");
       }
     }
 
+    // Alias for Bluefy iOS Browser scan trigger
+    const startBluefyScan = handleBluetoothConnection;
+
     function onBleDisconnected() {
       isBleConnected = false;
+      stopBleHeartbeat();
       document.getElementById("bleStatusDot").className = "w-2 h-2 rounded-full bg-amber-400";
       document.getElementById("bleBtnText").textContent = "Pair Matrix";
       document.getElementById("bleSyncTick").textContent = "SIMULATED";
@@ -1301,7 +1350,12 @@
     async function sendBleCommand(byteArray) {
       if (!isBleConnected || !bleCharacteristic) return;
       try {
-        await bleCharacteristic.writeValueWithoutResponse(new Uint8Array(byteArray));
+        const data = new Uint8Array(byteArray);
+        if (bleCharacteristic.properties.writeWithoutResponse) {
+          await bleCharacteristic.writeValueWithoutResponse(data);
+        } else {
+          await bleCharacteristic.writeValue(data);
+        }
       } catch (e) {
         console.warn("BLE write error:", e);
       }
@@ -1342,11 +1396,103 @@
       });
     }
 
+    // Screen Wake Lock API
+    let wakeLock = null;
+    async function requestWakeLock() {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          console.log("Screen Wake Lock active.");
+          wakeLock.addEventListener('release', () => {
+            console.log("Screen Wake Lock released.");
+          });
+        }
+      } catch (err) {
+        console.warn(`Screen Wake Lock note: ${err.name}, ${err.message}`);
+      }
+    }
+
+    // Silent Background Web Audio Keep-Alive Engine
+    let backgroundKeepAliveOsc = null;
+    function enableBackgroundKeepAliveAudio() {
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        
+        if (!backgroundKeepAliveOsc) {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(15, audioCtx.currentTime); // Inaudible sub-frequency
+          gain.gain.setValueAtTime(0.0001, audioCtx.currentTime); // Virtually silent (0.01%)
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start();
+          backgroundKeepAliveOsc = osc;
+          console.log("Background Web Audio keep-alive engaged.");
+        }
+      } catch (e) {
+        console.warn("Background audio engine note:", e);
+      }
+    }
+
+    // BLE Heartbeat Ping & Periodic Keep-Alive
+    let blePingInterval = null;
+    function startBleHeartbeat() {
+      stopBleHeartbeat();
+      blePingInterval = setInterval(async () => {
+        if (isBleConnected && bleCharacteristic) {
+          try {
+            // Low-frequency 15s keep-alive packet to prevent GATT timeout
+            await sendBleCommand([0x00]);
+          } catch (e) {
+            console.warn("Heartbeat ping error:", e);
+          }
+        }
+      }, 15000);
+    }
+
+    function stopBleHeartbeat() {
+      if (blePingInterval) {
+        clearInterval(blePingInterval);
+        blePingInterval = null;
+      }
+    }
+
+    // Page Visibility Listener for Background Re-connection & Wake Lock Refresh
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState === "visible") {
+        requestWakeLock();
+        if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+        if (bleDevice && !isBleConnected && bleDevice.gatt) {
+          try {
+            console.log("Re-engaging BLE GATT connection on returning to foreground...");
+            showIosToast("Re-connecting Matrix...", "🔄");
+            await bleDevice.gatt.connect();
+          } catch (e) {
+            console.warn("Auto-reconnect note:", e);
+          }
+        }
+      }
+    });
+
     // Startup Initialization
     window.addEventListener("DOMContentLoaded", () => {
       initGpsTracking();
       renderVirtualMatrix();
-      console.log("iPixel Pilot Pro with iOS Liquid Glass loaded.");
+      requestWakeLock();
+
+      // Arm background audio on first user touch / tap
+      const armBackgroundEngine = () => {
+        requestWakeLock();
+        enableBackgroundKeepAliveAudio();
+        window.removeEventListener("touchstart", armBackgroundEngine);
+        window.removeEventListener("click", armBackgroundEngine);
+      };
+      window.addEventListener("touchstart", armBackgroundEngine, { once: true });
+      window.addEventListener("click", armBackgroundEngine, { once: true });
+
+      console.log("iPixel Pilot Pro with iOS Liquid Glass & Background Keep-Alive loaded.");
     });
   </script>
 </body>
