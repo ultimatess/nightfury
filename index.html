@@ -1253,9 +1253,21 @@
         const candidateServices = [
           "0000fa02-0000-1000-8000-00805f9b34fb",
           "0000fa00-0000-1000-8000-00805f9b34fb",
+          "0000fa01-0000-1000-8000-00805f9b34fb",
+          "0000fa03-0000-1000-8000-00805f9b34fb",
           "0000ffe0-0000-1000-8000-00805f9b34fb",
+          "0000ffe5-0000-1000-8000-00805f9b34fb",
           "0000fff0-0000-1000-8000-00805f9b34fb",
-          0xfa02, 0xfa00, 0xffe0, 0xfff0
+          "0000ffd0-0000-1000-8000-00805f9b34fb",
+          "0000ae01-0000-1000-8000-00805f9b34fb",
+          "0000af00-0000-1000-8000-00805f9b34fb",
+          "0000cc01-0000-1000-8000-00805f9b34fb",
+          "0000ee01-0000-1000-8000-00805f9b34fb",
+          "00001000-0000-1000-8000-00805f9b34fb",
+          "00001800-0000-1000-8000-00805f9b34fb",
+          "00001801-0000-1000-8000-00805f9b34fb",
+          "0000180a-0000-1000-8000-00805f9b34fb",
+          0xfa02, 0xfa00, 0xfa01, 0xfa03, 0xffe0, 0xffe5, 0xfff0, 0xffd0, 0xae01, 0xaf00, 0xcc01, 0xee01, 0x1000, 0x1800, 0x1801, 0x180a
         ];
 
         bleDevice = await navigator.bluetooth.requestDevice({
@@ -1272,14 +1284,27 @@
 
         const server = await bleDevice.gatt.connect();
         
-        // Dynamic Resolution: Discover all available services instead of querying a single fixed UUID directly
+        // Multi-level Service Discovery for Bluefy / Web Bluetooth
         let services = [];
         try {
           services = await server.getPrimaryServices();
         } catch (e) {
-          console.warn("getPrimaryServices error, falling back to direct lookup:", e);
-          const targetSvc = await server.getPrimaryService(IPIXEL_SERVICE_UUID).catch(() => server.getPrimaryService(0xfa02));
-          services = [targetSvc];
+          console.warn("getPrimaryServices returned error, falling back to candidate sweep:", e);
+        }
+
+        // If getPrimaryServices() returned nothing or failed, try each candidate UUID individually
+        if (!services || services.length === 0) {
+          for (const cand of candidateServices) {
+            try {
+              const svc = await server.getPrimaryService(cand);
+              if (svc) {
+                services.push(svc);
+                console.log(`Discovered primary service via sweep: ${cand}`);
+              }
+            } catch (err) {
+              // Ignore non-matching candidate UUIDs
+            }
+          }
         }
 
         bleCharacteristic = null;
